@@ -2,6 +2,7 @@
 using NetKick.Services;
 using SharpPcap.LibPcap;
 using Spectre.Console;
+using System.Net.NetworkInformation; // added for PhysicalAddress
 
 namespace NetKick;
 
@@ -11,7 +12,8 @@ public class Program
     private static BlockingService? _blockingService;
     private static NetworkInterfaceInfo? _selectedInterface;
     private static NetworkDevice? _gateway;
-    private static readonly List<string> _logMessages = [];
+    private static readonly List<string> _logMessages = new();
+    private static readonly object _logLock = new();
 
     public static async Task Main(string[] args)
     {
@@ -61,6 +63,7 @@ public class Program
         _selectedInterface = selectedDevice.Value.Info;
         _arpService = new ArpService(selectedDevice.Value.Device, _selectedInterface);
         _arpService.LogMessage += (_, msg) => AddLog(msg);
+        _arpService.DeviceDiscovered += (_, d) => AddLog($"Discovered: {d.IpAddress} -> {d.MacAddressString}");
 
         AnsiConsole.MarkupLine($"\n[green]Selected:[/] {_selectedInterface.Description}");
         AnsiConsole.MarkupLine($"[blue]IP:[/] {_selectedInterface.IpAddress}");
@@ -78,8 +81,14 @@ public class Program
         if (_gateway == null)
         {
             AnsiConsole.MarkupLine("[yellow]Gateway not found in scan. Sending direct ARP request...[/]");
-            _arpService.SendArpRequest(_selectedInterface.GatewayAddress);
-            await Task.Delay(1000);
+
+            // Send a few ARP requests to the gateway to increase chance of discovery
+            for (int i = 0; i < 3; i++)
+            {
+                _arpService.SendArpRequest(_selectedInterface.GatewayAddress);
+                await Task.Delay(150);
+            }
+
             _gateway = _arpService.DiscoveredDevices.Values.FirstOrDefault(d => d.IsGateway);
         }
 
@@ -192,13 +201,43 @@ public class Program
     {
         if (_arpService == null) return;
 
+        // Start with discovered devices
         var devices = _arpService.DiscoveredDevices.Values.ToList();
 
-        if (devices.Count == 0)
+        // Ensure gateway and local interface are present in the list for display
+        if (_selectedInterface != null)
         {
-            AnsiConsole.MarkupLine("[yellow]No devices found.[/]");
-            return;
+            var gwIp = _selectedInterface.GatewayAddress;
+            if (gwIp != null && !devices.Any(d => d.IpAddress.Equals(gwIp)))
+            {
+                devices.Add(new NetworkDevice
+                {
+                    IpAddress = gwIp,
+                    MacAddress = PhysicalAddress.None,
+                    Hostname = null,
+                    IsGateway = true
+                });
+            }
+
+            var localIp = _selectedInterface.IpAddress;
+            if (!devices.Any(d => d.IpAddress.Equals(localIp)))
+            {
+                devices.Add(new NetworkDevice
+                {
+                    IpAddress = localIp,
+                    MacAddress = _selectedInterface.MacAddress,
+                    Hostname = null,
+                    IsGateway = false
+                });
+            }
         }
+
+        // Order devices: Gateway first, Local second, then rest by IP
+        var ordered = devices
+            .OrderByDescending(d => d.IsGateway)
+            .ThenByDescending(d => _selectedInterface != null && d.IpAddress.Equals(_selectedInterface.IpAddress))
+            .ThenBy(d => d.IpAddress.GetAddressBytes()[3])
+            .ToList();
 
         var table = new Table()
             .Border(TableBorder.Rounded)
@@ -207,28 +246,42 @@ public class Program
             .AddColumn("[yellow]IP Address[/]")
             .AddColumn("[yellow]MAC Address[/]")
             .AddColumn("[yellow]Hostname[/]")
-            .AddColumn("[yellow]Type[/]")
+            .AddColumn("[yellow]Role[/]")
             .AddColumn("[yellow]Status[/]");
 
         int index = 1;
-        foreach (var device in devices.OrderBy(d => d.IpAddress.GetAddressBytes()[3]))
+        foreach (var device in ordered)
         {
-            var status = device.IsBlocked ? "[red]BLOCKED[/]" : "[green]Online[/]";
-            var type = device.IsGateway ? "[cyan]Gateway[/]" : "Device";
+            // Determine role label: Gateway, Local, or Device. If both, show both.
+            var roles = new List<string>();
+            if (device.IsGateway) roles.Add("[cyan]Gateway[/]");
+            if (_selectedInterface != null && device.IpAddress.Equals(_selectedInterface.IpAddress)) roles.Add("[green]Local[/]");
+
+            var role = roles.Count > 0 ? string.Join(" / ", roles) : "Device";
+
+            // Determine status
+            string status;
+            if (device.IsBlocked)
+                status = "[red]Blocked[/]";
+            else
+                status = "[green]Online[/]";
+
+            var macBytes = device.MacAddress?.GetAddressBytes() ?? Array.Empty<byte>();
+            var macStr = macBytes.Length > 0 ? device.MacAddressString : "-";
 
             table.AddRow(
                 index.ToString(),
                 device.IpAddress.ToString(),
-                device.MacAddressString,
+                macStr,
                 device.Hostname ?? "-",
-                type,
+                role,
                 status);
 
             index++;
         }
 
         AnsiConsole.Write(table);
-        AnsiConsole.MarkupLine($"\n[blue]Total devices:[/] {devices.Count}");
+        AnsiConsole.MarkupLine($"\n[blue]Total devices:[/] {ordered.Count}");
     }
 
     private static async Task BlockDeviceMenuAsync()
@@ -346,27 +399,33 @@ public class Program
 
     private static void DisplayLogs()
     {
-        if (_logMessages.Count == 0)
+        lock (_logLock)
         {
-            AnsiConsole.MarkupLine("[yellow]No logs yet.[/]");
-            return;
+            if (_logMessages.Count == 0)
+            {
+                AnsiConsole.MarkupLine("[yellow]No logs yet.[/]");
+                return;
+            }
+
+            var panel = new Panel(string.Join("\n", _logMessages.TakeLast(20)))
+                .Header("[blue]Recent Logs[/]")
+                .Border(BoxBorder.Rounded);
+
+            AnsiConsole.Write(panel);
         }
-
-        var panel = new Panel(string.Join("\n", _logMessages.TakeLast(20)))
-            .Header("[blue]Recent Logs[/]")
-            .Border(BoxBorder.Rounded);
-
-        AnsiConsole.Write(panel);
     }
 
     private static void AddLog(string message)
     {
         var timestamp = DateTime.Now.ToString("HH:mm:ss");
-        _logMessages.Add($"[grey]{timestamp}[/] {message}");
+        lock (_logLock)
+        {
+            _logMessages.Add($"[grey]{timestamp}[/] {message}");
 
-        // Keep only last 100 messages
-        if (_logMessages.Count > 100)
-            _logMessages.RemoveAt(0);
+            // Keep only last 100 messages
+            if (_logMessages.Count > 100)
+                _logMessages.RemoveAt(0);
+        }
     }
 
     private static async Task CleanupAsync()
@@ -408,4 +467,3 @@ public class Program
         return Environment.UserName == "root";
     }
 }
-

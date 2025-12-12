@@ -1,4 +1,4 @@
-﻿﻿using System.Net;
+﻿using System.Net;
 using System.Net.NetworkInformation;
 using System.Collections.Concurrent;
 using NetKick.Models;
@@ -18,6 +18,11 @@ public class ArpService : IDisposable
     private readonly ConcurrentDictionary<IPAddress, NetworkDevice> _devices = new();
     private CancellationTokenSource? _scanCts;
     private bool _disposed;
+
+    // Added fields for scan serialization and tuning
+    private readonly object _scanLock = new();
+    private volatile bool _isScanning = false;
+    private int _responseWaitMs = 5000; // ms to wait for ARP replies after sending
 
     public IReadOnlyDictionary<IPAddress, NetworkDevice> DiscoveredDevices => _devices;
 
@@ -47,50 +52,89 @@ public class ArpService : IDisposable
     /// </summary>
     public async Task ScanNetworkAsync(IProgress<int>? progress = null, CancellationToken cancellationToken = default)
     {
+        // Prevent concurrent scans
+        lock (_scanLock)
+        {
+            if (_isScanning)
+            {
+                Log("A scan is already in progress.");
+                return;
+            }
+            _isScanning = true;
+        }
+
         _scanCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var token = _scanCts.Token;
 
-        Open();
-
-        // Start listening for ARP replies
-        var listenTask = Task.Run(() => ListenForArpReplies(token), token);
-
-        var allHosts = _interfaceInfo.GetAllHostAddresses().ToList();
-        var totalHosts = allHosts.Count;
-        var processed = 0;
-
-        Log($"Scanning {totalHosts} hosts in {_interfaceInfo.NetworkAddress}/{_interfaceInfo.PrefixLength}");
-
-        // Add gateway first
-        var gateway = new NetworkDevice
+        try
         {
-            IpAddress = _interfaceInfo.GatewayAddress,
-            MacAddress = PhysicalAddress.None,
-            IsGateway = true
-        };
+            Open();
 
-        // Send ARP requests to all hosts
-        foreach (var ip in allHosts)
-        {
-            if (token.IsCancellationRequested) break;
+            _devices.Clear();
 
-            SendArpRequest(ip);
-            processed++;
-            progress?.Report((int)((double)processed / totalHosts * 100));
+            // Start listening for ARP replies using polling listener
+            var listenTask = Task.Run(() => ListenForArpReplies(token), token);
 
-            // Small delay to avoid flooding
-            if (processed % 50 == 0)
-                await Task.Delay(10, token);
+            var allHosts = _interfaceInfo.GetAllHostAddresses().ToList();
+            var totalHosts = allHosts.Count;
+            var processed = 0;
+
+            Log($"Scanning {totalHosts} hosts in {_interfaceInfo.NetworkAddress}/{_interfaceInfo.PrefixLength}");
+
+            // Add gateway placeholder first (will be updated if discovered)
+            var gateway = new NetworkDevice
+            {
+                IpAddress = _interfaceInfo.GatewayAddress,
+                MacAddress = PhysicalAddress.None,
+                IsGateway = true
+            };
+
+            // Send ARP requests to all hosts with light pacing to avoid drops
+            foreach (var ip in allHosts)
+            {
+                if (token.IsCancellationRequested) break;
+
+                try
+                {
+                    SendArpRequest(ip);
+                }
+                catch (Exception ex)
+                {
+                    Log($"Error sending ARP request to {ip}: {ex.Message}");
+                }
+
+                processed++;
+                progress?.Report((int)((double)processed / totalHosts * 100));
+
+                // Small delay to avoid flooding the NIC (short and consistent)
+                if (processed % 1 == 0)
+                    await Task.Delay(3, token);
+
+                if (processed % 200 == 0)
+                    await Task.Delay(10, token);
+            }
+
+            // Wait a configurable window for replies to arrive
+            await Task.Delay(_responseWaitMs, token);
+
+            // Signal listener to stop and wait for it
+            _scanCts.Cancel();
+            try { await listenTask; } catch (OperationCanceledException) { }
+
+            Log($"Scan complete. Found {_devices.Count} devices.");
         }
+        catch (OperationCanceledException)
+        {
+            Log("Scan cancelled.");
+        }
+        finally
+        {
+            _scanCts?.Cancel();
+            _scanCts?.Dispose();
+            _scanCts = null;
 
-        // Wait a bit for responses
-        await Task.Delay(2000, token);
-
-        _scanCts.Cancel();
-
-        try { await listenTask; } catch (OperationCanceledException) { }
-
-        Log($"Scan complete. Found {_devices.Count} devices.");
+            _isScanning = false;
+        }
     }
 
     /// <summary>
@@ -105,7 +149,11 @@ public class ArpService : IDisposable
                 var result = _device.GetNextPacket(out var packetCapture);
 
                 if (result != GetPacketStatus.PacketRead)
+                {
+                    // small sleep to avoid tight loop if no packets
+                    Thread.Sleep(5);
                     continue;
+                }
 
                 var rawPacket = packetCapture.GetPacket();
                 var packet = Packet.ParsePacket(rawPacket.LinkLayerType, rawPacket.Data);
@@ -128,7 +176,7 @@ public class ArpService : IDisposable
                         IsGateway = senderIp.Equals(_interfaceInfo.GatewayAddress)
                     };
 
-                    // Try to resolve hostname
+                    // Try to resolve hostname asynchronously
                     Task.Run(() => ResolveHostname(device));
 
                     if (_devices.TryAdd(senderIp, device))
@@ -138,7 +186,28 @@ public class ArpService : IDisposable
                     }
                     else
                     {
-                        _devices[senderIp].LastSeen = DateTime.Now;
+                        var existing = _devices[senderIp];
+                        existing.LastSeen = DateTime.Now;
+
+                        // If MAC not set or placeholder, replace with a merged instance (init-only properties)
+                        if (existing.MacAddress == null || existing.MacAddress.Equals(PhysicalAddress.None))
+                        {
+                            var merged = new NetworkDevice
+                            {
+                                IpAddress = existing.IpAddress,
+                                MacAddress = senderMac,
+                                Hostname = existing.Hostname,
+                                Vendor = existing.Vendor,
+                                IsGateway = existing.IsGateway,
+                                IsBlocked = existing.IsBlocked,
+                                DiscoveredAt = existing.DiscoveredAt,
+                                LastSeen = DateTime.Now
+                            };
+
+                            _devices[senderIp] = merged;
+                            DeviceDiscovered?.Invoke(this, merged);
+                            Log($"Updated: {senderIp} -> {merged.MacAddressString}");
+                        }
                     }
                 }
             }
@@ -158,21 +227,28 @@ public class ArpService : IDisposable
     /// </summary>
     public void SendArpRequest(IPAddress targetIp)
     {
-        var ethernetPacket = new EthernetPacket(
-            _interfaceInfo.MacAddress,
-            PhysicalAddress.Parse("FF-FF-FF-FF-FF-FF"),
-            EthernetType.Arp);
+        try
+        {
+            var ethernetPacket = new EthernetPacket(
+                _interfaceInfo.MacAddress,
+                PhysicalAddress.Parse("FF-FF-FF-FF-FF-FF"),
+                EthernetType.Arp);
 
-        var arpPacket = new ArpPacket(
-            ArpOperation.Request,
-            PhysicalAddress.Parse("00-00-00-00-00-00"),
-            targetIp,
-            _interfaceInfo.MacAddress,
-            _interfaceInfo.IpAddress);
+            var arpPacket = new ArpPacket(
+                ArpOperation.Request,
+                PhysicalAddress.Parse("00-00-00-00-00-00"),
+                targetIp,
+                _interfaceInfo.MacAddress,
+                _interfaceInfo.IpAddress);
 
-        ethernetPacket.PayloadPacket = arpPacket;
+            ethernetPacket.PayloadPacket = arpPacket;
 
-        _device.SendPacket(ethernetPacket);
+            _device.SendPacket(ethernetPacket);
+        }
+        catch (Exception ex)
+        {
+            Log($"Error sending ARP request to {targetIp}: {ex.Message}");
+        }
     }
 
     /// <summary>
@@ -263,4 +339,3 @@ public class ArpService : IDisposable
             _device.Close();
     }
 }
-

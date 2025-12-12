@@ -1,11 +1,6 @@
 ﻿# NetKick - ARP Spoofer & Network Blocker
 
-[![.NET](https://img.shields.io/badge/.NET-10.0-512BD4?logo=dotnet)](https://dotnet.microsoft.com/)
-[![C#](https://img.shields.io/badge/C%23-14-239120?logo=csharp)](https://docs.microsoft.com/en-us/dotnet/csharp/)
-[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows)](https://www.microsoft.com/windows)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
-A powerful network tool built with C# 14 and .NET 10 that allows you to scan your local network, discover devices, and block/unblock internet access for specific devices using ARP spoofing.
+A powerful network tool built with C# and .NET 10 that allows you to scan your local network, discover devices, and block/unblock internet access for specific devices using ARP spoofing.
 
 ![Warning](https://img.shields.io/badge/⚠️-Educational%20Purpose%20Only-red)
 
