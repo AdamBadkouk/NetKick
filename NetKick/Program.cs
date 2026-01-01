@@ -290,6 +290,7 @@ public class Program
 
         var devices = _arpService.DiscoveredDevices.Values
             .Where(d => !d.IsGateway && !d.IsBlocked)
+            .OrderBy(d => d.IpAddress, new IpAddressComparer())
             .ToList();
 
         if (devices.Count == 0)
@@ -367,7 +368,9 @@ public class Program
     {
         if (_blockingService == null) return;
 
-        var blocked = _blockingService.BlockedDevices.Values.ToList();
+        var blocked = _blockingService.BlockedDevices.Values
+            .OrderBy(b => b.Device.IpAddress, new IpAddressComparer())
+            .ToList();
 
         if (blocked.Count == 0)
         {
@@ -465,5 +468,26 @@ public class Program
             return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
         }
         return Environment.UserName == "root";
+    }
+}
+
+public class IpAddressComparer : IComparer<System.Net.IPAddress>
+{
+    public int Compare(System.Net.IPAddress? x, System.Net.IPAddress? y)
+    {
+        if (x == null && y == null) return 0;
+        if (x == null) return -1;
+        if (y == null) return 1;
+
+        var xBytes = x.GetAddressBytes();
+        var yBytes = y.GetAddressBytes();
+
+        for (int i = 0; i < Math.Min(xBytes.Length, yBytes.Length); i++)
+        {
+            int result = xBytes[i].CompareTo(yBytes[i]);
+            if (result != 0) return result;
+        }
+
+        return xBytes.Length.CompareTo(yBytes.Length);
     }
 }
