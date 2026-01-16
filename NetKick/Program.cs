@@ -33,8 +33,58 @@ public class Program
         // Check for Npcap
         if (!NetworkService.IsNpcapInstalled())
         {
-            AnsiConsole.MarkupLine("[red]⚠ Npcap is not installed or not accessible![/]");
-            AnsiConsole.MarkupLine("[yellow]Please install Npcap from: https://npcap.com[/]");
+            AnsiConsole.MarkupLine("[red]⚠ Npcap is not installed![/]");
+
+            var installerPath = Path.Combine(Path.GetTempPath(), "npcap-installer.exe");
+
+            try
+            {
+                // Download Npcap
+                await AnsiConsole.Status()
+                    .Spinner(Spinner.Known.Dots)
+                    .StartAsync("[blue]Downloading Npcap...[/]", async ctx =>
+                    {
+                        using var httpClient = new System.Net.Http.HttpClient();
+                        var response = await httpClient.GetAsync("https://npcap.com/dist/npcap-1.80.exe");
+                        response.EnsureSuccessStatusCode();
+                        
+                        await using var fileStream = new FileStream(installerPath, FileMode.Create);
+                        await response.Content.CopyToAsync(fileStream);
+                    });
+
+                AnsiConsole.MarkupLine("[green]✓ Download complete[/]");
+                AnsiConsole.MarkupLine("[yellow]Launching installer... Please complete the installation wizard.[/]");
+
+                // Launch installer (GUI mode - user completes wizard)
+                var processInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = installerPath,
+                    UseShellExecute = true
+                };
+
+                using var process = System.Diagnostics.Process.Start(processInfo);
+                if (process != null)
+                {
+                    await process.WaitForExitAsync();
+                }
+
+                // Cleanup installer
+                if (File.Exists(installerPath))
+                    File.Delete(installerPath);
+
+                AnsiConsole.MarkupLine("[yellow]⚠ Please restart NetKick to continue.[/]");
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine("[red]✗ Download failed.[/]");
+                AnsiConsole.MarkupLine($"[grey]{ex.Message}[/]");
+                AnsiConsole.MarkupLine("[yellow]Please install manually from:[/] https://npcap.com");
+                
+                // Cleanup on failure
+                if (File.Exists(installerPath))
+                    File.Delete(installerPath);
+            }
+
             Console.ReadKey();
             return;
         }
@@ -53,6 +103,7 @@ public class Program
             await CleanupAsync();
         }
     }
+
 
     private static async Task RunAsync()
     {
@@ -134,21 +185,12 @@ public class Program
     {
         if (_arpService == null) return;
 
-        await AnsiConsole.Progress()
-            .Columns(
-                new TaskDescriptionColumn(),
-                new ProgressBarColumn(),
-                new PercentageColumn(),
-                new SpinnerColumn())
-            .StartAsync(async ctx =>
+        await AnsiConsole.Status()
+            .Spinner(Spinner.Known.Dots)
+            .StartAsync("[green]Scanning network...[/]", async ctx =>
             {
-                var task = ctx.AddTask("[green]Scanning network...[/]");
-                var progress = new Progress<int>(percent => task.Value = percent);
-
                 using var cts = new CancellationTokenSource();
-                await _arpService.ScanNetworkAsync(progress, cts.Token);
-
-                task.Value = 100;
+                await _arpService.ScanNetworkAsync(null, cts.Token);
             });
 
         DisplayDevices();
